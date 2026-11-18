@@ -11,6 +11,29 @@ scaled back by the target's hour-1 print, with the spread slightly shrunk
 (a factor that eases from 0.85 early in the day to 0.70 by hour 24) because
 the pooled spread overstates how much one specific launch wanders.
 
+One regime breaks that logic: launches whose hour-1 print is a pre-unlock
+trickle (a few thousand viewers, a small fraction of the audience the game
+had already drawn before launch). Their day steps up by orders of magnitude
+once the unlock lands, at an hour that varies from game to game, so ratios
+to hour 1 say almost nothing. When hour 1 looks like that — at most a few
+thousand viewers and at most 60% of the pre-launch peak — the forecast is
+built instead from the comparable launches that stepped the same way:
+before each one's step it contributes the target's own hour-1 level scaled
+by its pre-step ratio, from its step on it contributes its absolute viewer
+level (stepper peaks cluster within ~4x of each other while their trickles
+span 30x). If the case notes state the unlock instant, every comparable's
+step is aligned to it; otherwise step timing stays a population spread.
+Three refinements sit on top of that construction, each fitted on the
+practice pool: the stepper pool's weights tilt toward comparables that
+stepped to a major audience (a gated target is a major launch, and minor
+launches' absolute levels would dilute its plateau); the gated quantile
+tracks are smoothed across hours with a binomial kernel, because a step
+lands within a few hours of the pool's timing, not exactly on it; and
+anchored targets whose unlock pattern the notes never classify get a
+late-day centre calibration (their pooled centre otherwise runs hot —
+see model_forecast). Targets with a classified rolling/mixed unlock take
+exactly the original anchored path.
+
 Everything is standard library, deterministic, and defensive: any case that
 cannot be modelled still gets a valid, flat, wide forecast rather than an
 invalid file.
@@ -38,6 +61,18 @@ PC_UP = 0.7              # PC target, comparable console-only
 GAMMA_START = 0.85       # spread multiplier at hour 2
 GAMMA_END = 0.70         # spread multiplier at hour 24
 MIN_DAY_HOURS = 18       # comparable must cover this much of its launch day
+GATE_H1 = 6000.0         # trickle gate: hour-1 viewers at/below this ...
+GATE_A = 0.6             # ... and at/below this share of the pre-launch peak
+STEP_THRESH = 1.386      # log(peak / hour-1) at/above which a comp "stepped"
+STEP_TEMPER = 0.3        # tempering for stepper-pool factor weights
+TAU_OFFSET = -3          # step-hour lead vs the stated unlock instant
+STEP_PEAK_WEXP = 0.5     # stepper-pool weight tilt toward major launches:
+                         # weight x (comp peak / 1e5) ** this
+STEP_SMOOTH_PASSES = 5   # binomial smoothing passes over gated quantile
+                         # tracks (step timing is uncertain by hours)
+UG_MU_SHRINK = 0.35      # unclassified-unlock targets: late-day centre
+UG_MU_BIAS = -0.15       # shrink (positive centres) + constant bias, both
+                         # ramped by (hour - 2) / 22; see model_forecast
 
 UNLOCK_MATCH = {
     ("rolling", "rolling"): 1.0, ("rolling", "mixed"): 0.6,
@@ -198,6 +233,173 @@ def similarity(target, comp):
     return w
 
 
+def factor_similarity(target, comp):
+    """Regime-match part of similarity(): unlock class, early access, weak
+    tier, platform and mode — without the audience-scale kernels, which are
+    meaningless for a comparable whose hour 1 was a trickle."""
+    w = UNLOCK_MATCH[(target["unlock"], comp["unlock"])]
+    if comp["ea"] != target["ea"]:
+        w *= EA_FACTOR
+    if comp["weak"]:
+        w *= WEAK_FACTOR
+    if comp["has_pc"] != target["has_pc"]:
+        w *= PC_DOWN if comp["has_pc"] else PC_UP
+    w *= MODE_MATCH[(target["mode"], comp["mode"])]
+    return w
+
+
+def weighted_quantile(xs, ws, tau):
+    """Linear-interpolated weighted empirical quantile."""
+    order = sorted(range(len(xs)), key=lambda i: xs[i])
+    xs = [xs[i] for i in order]
+    ws = [ws[i] for i in order]
+    total = sum(ws)
+    if total <= 0:
+        return xs[len(xs) // 2]
+    cum = []
+    acc = 0.0
+    for w in ws:
+        acc += w / total
+        cum.append(acc)
+    if tau <= cum[0]:
+        return xs[0]
+    for i in range(1, len(xs)):
+        if tau <= cum[i]:
+            frac = (tau - cum[i - 1]) / (cum[i] - cum[i - 1])
+            return xs[i - 1] + frac * (xs[i] - xs[i - 1])
+    return xs[-1]
+
+
+_STAMP_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})")
+
+
+def parse_unlock_step_hour(notes, day_start):
+    """Step hour (1..24) if the notes state an ISO unlock time on launch day.
+
+    Research notes sometimes give the exact unlock instant ("single global
+    unlock ... = 2024-08-20T02:00Z"). The audience reaches half its plateau
+    roughly two hours before that stated instant — countdown and preload
+    streams, and hourly buckets labelled by their end — so the step is
+    placed TAU_OFFSET hours earlier than the hour containing the instant.
+    Returns None when no same-day ISO timestamp is present.
+    """
+    if not notes or not day_start:
+        return None
+    try:
+        start = parse_ts(day_start)
+    except Exception:
+        return None
+    for m in _STAMP_RE.finditer(notes):
+        try:
+            stamp = datetime(int(m.group(1)), int(m.group(2)),
+                             int(m.group(3)), int(m.group(4)),
+                             int(m.group(5)), tzinfo=timezone.utc)
+        except ValueError:
+            continue
+        delta_h = (stamp - start).total_seconds() / 3600.0
+        if 0 <= delta_h < 24:
+            return min(24, max(1, int(delta_h) + 1 + TAU_OFFSET))
+    return None
+
+
+def stepper_forecast(case, target, feats_list):
+    """Forecast for a trickle target, from transplanted stepper curves.
+
+    Returns None when the target's hour 1 is a real launch anchor (the gate
+    does not fire) or when no comparable stepped. Each stepper comparable
+    (its own day peaked at >= ~4x its hour 1) is reduced to a step hour —
+    the first hour its log-ratio reaches half its plateau — and votes at
+    target hour h from its own timeline at j = h - (tau_t - tau_c), where
+    tau_t is the target's step hour from its stated unlock time (no stated
+    time: no shift, step timing stays a population spread). Before its
+    step, the vote is the target's hour-1 level scaled by the comparable's
+    pre-step ratio; from its step on, it is the comparable's absolute
+    level. Quantiles are the weighted empirical quantiles of those votes.
+    """
+    pre_max = target["pre_max"]
+    if not pre_max or target["p1"] > GATE_H1 \
+            or target["p1"] / pre_max > GATE_A:
+        return None
+    tau_t = parse_unlock_step_hour(case.get("notes") or "",
+                                   case.get("day_start") or "")
+    steppers = []
+    for feats in feats_list:
+        day = feats["day"]
+        plateau = math.log(max(day.values()) / day[1])
+        if plateau < STEP_THRESH:
+            continue
+        tau_c = 25
+        for h in range(2, 25):
+            r = log_ratio(day, h)
+            if r is not None and r >= 0.5 * plateau:
+                tau_c = h
+                break
+        w = factor_similarity(target, feats) ** STEP_TEMPER
+        # A gated target is a major launch whose audience has not arrived;
+        # minor launches in the pool (peaks an order of magnitude smaller)
+        # would otherwise dilute every level vote, so weight tilts toward
+        # comparables that stepped to a major audience.
+        w *= (max(day.values()) / 1e5) ** STEP_PEAK_WEXP
+        if w > 1e-9:
+            steppers.append((feats, w, tau_c))
+    if not steppers:
+        return None
+    log_p1 = math.log(target["p1"])
+    hours = []
+    for row in case["forecast"]:
+        h = row["hour"]
+        xs, ws = [], []
+        for feats, w, tau_c in steppers:
+            day = feats["day"]
+            shift = (tau_t - tau_c) if tau_t is not None else 0
+            j = min(24, max(1, h - shift))
+            r = log_ratio(day, j)
+            if r is None:
+                continue
+            if j < tau_c:
+                xs.append(log_p1 + r)
+            else:
+                xs.append(math.log(day[1]) + r)
+            ws.append(w)
+        if not xs:
+            hours.append({"hour": h, "q": shape_row(target["p1"], 0.0, 0.5)})
+            continue
+        row_q = []
+        for tau in LEVELS:
+            q = weighted_quantile(xs, ws, tau)
+            row_q.append(min(max(math.exp(q), 0.01), 1e9))
+        for i in range(1, len(row_q)):
+            row_q[i] = max(row_q[i], row_q[i - 1])
+        hours.append({"hour": h, "q": [round(v, 4) for v in row_q]})
+    smooth_tracks(hours)
+    return {"hours": hours}
+
+
+def smooth_tracks(hours):
+    """Blur the gated forecast's log-quantile tracks across hours.
+
+    A stepper's unlock lands within an hour or two of whenever the pool
+    says it should, rarely exactly on it; pricing that timing uncertainty
+    in means each hour's quantiles borrow from their neighbours. Repeated
+    [0.25, 0.5, 0.25] passes convolve the tracks with a binomial kernel
+    (half-width = number of passes), in log space, keeping every row
+    clamped and non-decreasing.
+    """
+    for _ in range(STEP_SMOOTH_PASSES):
+        logs = [[math.log(max(q, 1e-9)) for q in row["q"]] for row in hours]
+        for i, row in enumerate(hours):
+            vals = []
+            for k in range(len(LEVELS)):
+                a = logs[i - 1][k] if i > 0 else logs[i][k]
+                b = logs[i][k]
+                c = logs[i + 1][k] if i < len(logs) - 1 else logs[i][k]
+                vals.append(min(max(math.exp(0.25 * a + 0.5 * b + 0.25 * c),
+                                    0.01), 1e9))
+            for k in range(1, len(vals)):
+                vals[k] = max(vals[k], vals[k - 1])
+            row["q"] = [round(v, 4) for v in vals]
+
+
 def log_ratio(day, h):
     """log(viewers at hour h / viewers at hour 1), interpolated if h is missing."""
     base = math.log(day[1])
@@ -214,11 +416,17 @@ def log_ratio(day, h):
 def model_forecast(case):
     target = target_features(case)
     p1 = target["p1"]
-    pool = []
+    feats_list = []
     for comp in case.get("comparables") or []:
         feats = comparable_features(comp)
         if feats is None or feats["name"] == target["name"]:
             continue
+        feats_list.append(feats)
+    gated = stepper_forecast(case, target, feats_list)
+    if gated is not None:
+        return gated
+    pool = []
+    for feats in feats_list:
         w = similarity(target, feats)
         if w > 1e-6:
             pool.append((feats, w))
@@ -238,6 +446,18 @@ def model_forecast(case):
             sd = math.sqrt(max(var, 1e-6))
         else:
             mu, sd = 0.0, 0.5
+        if target["unlock"] in ("unknown", "global"):
+            # Calibration for targets whose notes never classify the
+            # unlock pattern. On the practice pool their pooled centre
+            # runs systematically hot late in the day: the pool's riser
+            # curves keep building, while an unclassified target's hour 1
+            # was usually already a real launch measurement, so its day
+            # more often flattens or decays. Shrink a positive centre and
+            # subtract a small bias, both ramped in over the day. Targets
+            # with a classified unlock (rolling/mixed) are not adjusted.
+            if mu > 0:
+                mu *= 1.0 - UG_MU_SHRINK * (h - 2) / 22.0
+            mu += UG_MU_BIAS * (h - 2) / 22.0
         gamma = GAMMA_START + (GAMMA_END - GAMMA_START) * (h - 2) / 22.0
         hours.append({"hour": h, "q": shape_row(p1, mu, gamma * sd)})
     return {"hours": hours}
